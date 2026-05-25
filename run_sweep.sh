@@ -32,7 +32,7 @@ if [ -n "$DATAFILE" ]; then
     data_flag="-datafile $DATAFILE"
 fi
 
-echo "collections,split,workers,batch,ops,errors,elapsed_s,throughput_ops_s,call_avg_ms,call_p50_ms,call_p99_ms" > "$OUT"
+echo "collections,keyspace,split,workers,batch,ops,errors,elapsed_s,throughput_ops_s,call_avg_ms,call_p50_ms,call_p99_ms" > "$OUT"
 
 for k in $COLLECTIONS; do
     echo ">>> collections=$k"
@@ -42,8 +42,10 @@ for k in $COLLECTIONS; do
         -workers "$WORKERS" -records "$RECORDS" -batch "$BATCH" \
         $data_flag -drop \
         | grep '^RESULT,')
-    # strip "RESULT," and the key= prefixes -> bare CSV row
-    echo "$line" | sed -e 's/^RESULT,//' -e 's/[a-z_]*=//g' >> "$OUT"
+    # strip "RESULT," then keep only the value after each "key=" (robust to
+    # digits in key names like call_p50_ms).
+    echo "$line" | sed 's/^RESULT,//' \
+        | awk -F, '{for(i=1;i<=NF;i++){n=index($i,"=");printf "%s%s",(i>1?",":""),substr($i,n+1)} print ""}' >> "$OUT"
 done
 
 echo

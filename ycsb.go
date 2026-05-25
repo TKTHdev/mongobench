@@ -22,6 +22,7 @@ type OpKind int
 const (
 	OpInsert OpKind = iota
 	OpUpdate
+	OpUpsert
 )
 
 // collIndex picks which collection (0..k-1) this op lands in.
@@ -53,6 +54,27 @@ func genSynthetic(records, fields, fieldLen int) []Op {
 			f[fmt.Sprintf("field%d", j)] = payload
 		}
 		ops[i] = Op{Kind: OpInsert, Key: fmt.Sprintf("user%d", i), Fields: f}
+	}
+	return ops
+}
+
+// genContention builds `records` UPSERT ops whose keys are drawn (round-robin)
+// from a key space of `keyspace` distinct documents. A small keyspace forces
+// many concurrent writers onto the same few documents, exposing WiredTiger's
+// document-level write concurrency control: narrow keyspace -> contention ->
+// serialized writes; wide keyspace -> no collisions -> full parallelism.
+func genContention(records, keyspace, fields, fieldLen int) []Op {
+	if keyspace < 1 {
+		keyspace = 1
+	}
+	payload := strings.Repeat("x", fieldLen)
+	ops := make([]Op, records)
+	for i := 0; i < records; i++ {
+		f := make(map[string]string, fields)
+		for j := 0; j < fields; j++ {
+			f[fmt.Sprintf("field%d", j)] = payload
+		}
+		ops[i] = Op{Kind: OpUpsert, Key: fmt.Sprintf("user%d", i%keyspace), Fields: f}
 	}
 	return ops
 }

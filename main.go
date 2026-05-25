@@ -38,6 +38,7 @@ type config struct {
 	batch       int
 	drop        bool
 	poolSize    int
+	keyspace    int
 }
 
 func main() {
@@ -55,6 +56,7 @@ func main() {
 	flag.IntVar(&cfg.batch, "batch", 1, "documents per write call: 1=InsertOne, >1=InsertMany")
 	flag.BoolVar(&cfg.drop, "drop", true, "drop target collections before the run")
 	flag.IntVar(&cfg.poolSize, "poolsize", 0, "connection pool size (0 = workers)")
+	flag.IntVar(&cfg.keyspace, "keyspace", 0, "document-level contention test: UPSERT into N distinct docs (0 = disabled, unique-INSERT mode)")
 	flag.Parse()
 
 	if cfg.collections < 1 {
@@ -76,6 +78,10 @@ func main() {
 			log.Fatalf("read datafile: %v", err)
 		}
 		log.Printf("loaded %d write ops from %s", len(ops), cfg.datafile)
+	} else if cfg.keyspace > 0 {
+		ops = genContention(cfg.records, cfg.keyspace, cfg.fields, cfg.fieldLen)
+		log.Printf("generated %d UPSERT ops over keyspace=%d distinct docs (%d fields x %dB)",
+			len(ops), cfg.keyspace, cfg.fields, cfg.fieldLen)
 	} else {
 		ops = genSynthetic(cfg.records, cfg.fields, cfg.fieldLen)
 		log.Printf("generated %d synthetic INSERT ops (%d fields x %dB)", len(ops), cfg.fields, cfg.fieldLen)
@@ -175,11 +181,10 @@ func runWorker(ctx context.Context, colls []*mongo.Collection, ops []Op, collOf 
 			c := colls[collOf[i]]
 			t0 := time.Now()
 			var err error
-			if op.Kind == OpUpdate {
-				_, err = c.UpdateOne(ctx, bson.D{{Key: "_id", Value: op.Key}},
-					bson.D{{Key: "$set", Value: toDoc(op.Fields)}})
-			} else {
+			if op.Kind == OpInsert {
 				_, err = c.InsertOne(ctx, buildDoc(op))
+			} else {
+				err = writeUpdate(ctx, c, op)
 			}
 			lats = append(lats, msSince(t0))
 			if err != nil {
@@ -206,10 +211,10 @@ func runWorker(ctx context.Context, colls []*mongo.Collection, ops []Op, collOf 
 	for i := lo; i < hi; i++ {
 		op := ops[i]
 		k := collOf[i]
-		if op.Kind == OpUpdate {
+		if op.Kind != OpInsert {
+			// UPDATE/UPSERT cannot be batched via InsertMany; issue individually.
 			t0 := time.Now()
-			_, err := colls[k].UpdateOne(ctx, bson.D{{Key: "_id", Value: op.Key}},
-				bson.D{{Key: "$set", Value: toDoc(op.Fields)}})
+			err := writeUpdate(ctx, colls[k], op)
 			lats = append(lats, msSince(t0))
 			if err != nil {
 				atomic.AddInt64(errCount, 1)
@@ -225,6 +230,21 @@ func runWorker(ctx context.Context, colls []*mongo.Collection, ops []Op, collOf 
 		flush(k)
 	}
 	return lats
+}
+
+// writeUpdate issues an UpdateOne for OpUpdate / OpUpsert. For OpUpsert it sets
+// upsert:true so a repeated key updates the same existing document (the source
+// of document-level contention) rather than failing.
+func writeUpdate(ctx context.Context, c *mongo.Collection, op Op) error {
+	opts := options.Update()
+	if op.Kind == OpUpsert {
+		opts.SetUpsert(true)
+	}
+	_, err := c.UpdateOne(ctx,
+		bson.D{{Key: "_id", Value: op.Key}},
+		bson.D{{Key: "$set", Value: toDoc(op.Fields)}},
+		opts)
+	return err
 }
 
 func buildDoc(op Op) bson.D {
@@ -251,8 +271,9 @@ func report(cfg config, totalOps int, elapsed time.Duration, lats []float64, err
 
 	fmt.Printf("\n========== mongobench results ==========\n")
 	fmt.Printf("collections     : %d (%s)\n", cfg.collections, cfg.split)
+	fmt.Printf("keyspace        : %s\n", keyspaceLabel(cfg.keyspace))
 	fmt.Printf("workers         : %d\n", cfg.workers)
-	fmt.Printf("write mode      : %s\n", modeLabel(cfg.batch))
+	fmt.Printf("write mode      : %s\n", modeLabel(cfg.batch, cfg.keyspace))
 	fmt.Printf("total ops       : %d\n", totalOps)
 	fmt.Printf("errors          : %d\n", errCount)
 	fmt.Printf("elapsed         : %.3fs\n", elapsed.Seconds())
@@ -261,12 +282,22 @@ func report(cfg config, totalOps int, elapsed time.Duration, lats []float64, err
 	fmt.Printf("========================================\n")
 
 	// Machine-readable line for sweep aggregation.
-	fmt.Printf("RESULT,collections=%d,split=%s,workers=%d,batch=%d,ops=%d,errors=%d,elapsed_s=%.3f,throughput_ops_s=%.0f,call_avg_ms=%.3f,call_p50_ms=%.3f,call_p99_ms=%.3f\n",
-		cfg.collections, cfg.split, cfg.workers, cfg.batch, totalOps, errCount,
+	fmt.Printf("RESULT,collections=%d,keyspace=%d,split=%s,workers=%d,batch=%d,ops=%d,errors=%d,elapsed_s=%.3f,throughput_ops_s=%.0f,call_avg_ms=%.3f,call_p50_ms=%.3f,call_p99_ms=%.3f\n",
+		cfg.collections, cfg.keyspace, cfg.split, cfg.workers, cfg.batch, totalOps, errCount,
 		elapsed.Seconds(), thr, avg, p50, p99)
 }
 
-func modeLabel(batch int) string {
+func keyspaceLabel(keyspace int) string {
+	if keyspace <= 0 {
+		return "unique INSERT (no contention)"
+	}
+	return fmt.Sprintf("%d distinct docs (UPSERT)", keyspace)
+}
+
+func modeLabel(batch, keyspace int) string {
+	if keyspace > 0 {
+		return "UpdateOne upsert (single)"
+	}
 	if batch <= 1 {
 		return "InsertOne (single)"
 	}
